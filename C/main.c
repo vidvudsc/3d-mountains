@@ -1,6 +1,5 @@
 #include "raylib.h"
 #include "raymath.h"
-#include <math.h>
 #include <stdlib.h>
 #include <time.h>
 
@@ -61,21 +60,34 @@ float PerlinNoise(float x, float y) {
 
 // Generate heightmap using layered Perlin noise
 void GenerateHeightMap(float heightmap[MAP_SIZE][MAP_SIZE]) {
+    // Random offsets to create different terrain every time
+    float offsetX = (float)GetRandomValue(0, 10000);
+    float offsetZ = (float)GetRandomValue(0, 10000);
+
     for (int z = 0; z < MAP_SIZE; z++) {
         for (int x = 0; x < MAP_SIZE; x++) {
             float noiseValue = 0.0f;
-            float amplitude = 1.0f;
-            float frequency = 0.01f;
-            for (int i = 0; i < NOISE_OCTAVES; i++) {
-                noiseValue += PerlinNoise(x * frequency, z * frequency) * amplitude;
-                amplitude *= NOISE_PERSISTENCE;
-                frequency *= 2.0f;
+            float amplitude = 1.0f;  // Starting amplitude
+            float frequency = 0.01f; // Starting frequency
+            int numLayers = 6;       // Six layers of Perlin noise
+
+            for (int i = 0; i < numLayers; i++) {
+                // Apply Perlin noise at the current frequency and amplitude
+                noiseValue += PerlinNoise((x + offsetX) * frequency, (z + offsetZ) * frequency) * amplitude;
+
+                // Increase frequency and decrease amplitude for the next layer
+                amplitude *= 0.5f;   // Decrease amplitude
+                frequency *= 2.0f;   // Increase frequency
             }
+            
+            // Normalize the noise value and scale it
             noiseValue = (noiseValue + 1.0f) * 0.5f;
             heightmap[x][z] = noiseValue * HEIGHT_SCALE;
         }
     }
 }
+
+
 
 // Apply erosion to reduce peak sharpness
 void ApplyErosion(float heightmap[MAP_SIZE][MAP_SIZE], int iterations) {
@@ -113,28 +125,44 @@ Color ColorLerp(Color color1, Color color2, float amount) {
 }
 
 // Define colors for different biomes
-Color ICE_COLOR = { 200, 230, 255, 255 };   // Light blue for ice
-Color ROCK_COLOR = { 120, 120, 120, 255 };  // Gray for rocky areas
-Color WATER_COLOR = { 0, 70, 130, 255 };    // Deep blue for water
-Color GRASS_COLOR = { 34, 139, 34, 255 };   // Green for grassy areas
-Color SAND_COLOR = { 194, 178, 128, 255 };  // Sandy color for beaches
+Color ICE_COLOR = { 230, 230, 230, 255 };   // Light blue for ice
+Color ROCK_COLOR = { 128, 128, 128, 255 };  // Gray for rocky areas
+Color WATER_COLOR = { 0, 26, 51, 255 };     // Deep blue for water
+Color GRASS_COLOR = { 77, 102, 77, 255 };    // Green for grassy areas
 
-// Biome color based on height, simulating different biomes
+
+
+// Biome color based on height, without sand and with varied grass shades
 Color GetBiomeColor(float height, float minHeight, float maxHeight) {
     float normalizedHeight = (height - minHeight) / (maxHeight - minHeight);
 
     if (normalizedHeight < 0.2f) {
-        return WATER_COLOR;
-    } else if (normalizedHeight < 0.3f) {
-        return ColorLerp(WATER_COLOR, SAND_COLOR, (normalizedHeight - 0.2f) * 10.0f);
+        return WATER_COLOR; // Deep water
     } else if (normalizedHeight < 0.6f) {
-        return ColorLerp(SAND_COLOR, GRASS_COLOR, (normalizedHeight - 0.3f) * 3.33f);
+        // Grass biome with varied shades
+        if (normalizedHeight < 0.4f) {
+            return (Color){ 60, 80, 60, 255 }; // Darker green
+        } else {
+            return (Color){ 90, 120, 90, 255 }; // Lighter green
+        }
     } else if (normalizedHeight < 0.85f) {
-        return ColorLerp(GRASS_COLOR, ROCK_COLOR, (normalizedHeight - 0.6f) * 4.0f);
+        return ROCK_COLOR; // Rocky area
     } else {
-        return ColorLerp(ROCK_COLOR, ICE_COLOR, (normalizedHeight - 0.85f) * 6.67f);
+        return ICE_COLOR; // Snow/ice peaks
     }
 }
+Color ApplyAmbientOcclusion(Color baseColor, float height, float neighborHeight) {
+    float shadowFactor = 1.0f - (height - neighborHeight) * 0.1f; // Adjust intensity as needed
+    shadowFactor = Clamp(shadowFactor, 0.5f, 1.0f); // Ensure shadow factor doesn't go too dark
+    return (Color){
+        (unsigned char)(baseColor.r * shadowFactor),
+        (unsigned char)(baseColor.g * shadowFactor),
+        (unsigned char)(baseColor.b * shadowFactor),
+        baseColor.a
+    };
+}
+
+
 
 // Height-based color for height map mode
 Color GetHeightMapColor(float height, float minHeight, float maxHeight) {
@@ -196,12 +224,14 @@ Model GenerateTerrainModel(float heightmap[MAP_SIZE][MAP_SIZE], bool useBiomeCol
     Model model = LoadModelFromMesh(mesh);
     return model;
 }
-
 int main(void) {
     const int screenWidth = 1000;
     const int screenHeight = 800;
 
     InitWindow(screenWidth, screenHeight, "Raylib Terrain with Toggleable Color Modes");
+
+    // Seed random number generator
+    srand(time(NULL));
 
     Camera3D camera = { 0 };
     camera.position = (Vector3){ 300.0f, 300.0f, 300.0f };
@@ -212,7 +242,7 @@ int main(void) {
 
     bool useBiomeColors = true;
     float rotationAngleY = 0.0f;
-    float cameraDistance = 500.0f;
+    float cameraDistance = 250.0f;
 
     float heightmap[MAP_SIZE][MAP_SIZE];
     GenerateHeightMap(heightmap);
@@ -228,6 +258,13 @@ int main(void) {
             terrainModel = GenerateTerrainModel(heightmap, useBiomeColors);
         }
 
+        if (IsKeyPressed(KEY_R)) { // Press R to regenerate terrain
+            GenerateHeightMap(heightmap);
+            ApplyErosion(heightmap, EROSION_ITERATIONS);
+            UnloadModel(terrainModel);
+            terrainModel = GenerateTerrainModel(heightmap, useBiomeColors);
+        }
+
         if (IsKeyDown(KEY_A)) rotationAngleY += 0.01f;
         if (IsKeyDown(KEY_D)) rotationAngleY -= 0.01f;
 
@@ -237,7 +274,7 @@ int main(void) {
 
         float camX = cameraDistance * sinf(rotationAngleY);
         float camZ = cameraDistance * cosf(rotationAngleY);
-        float camY = 300.0f;
+        float camY = cameraDistance * 0.6f; // Lower Y value proportionally with distance
 
         camera.position = Vector3Add(camera.target, (Vector3){ camX, camY, camZ });
 

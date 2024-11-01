@@ -12,9 +12,9 @@ pygame.init()
 width, height = 1024, 768
 pygame.display.set_mode((width, height), DOUBLEBUF | OPENGL)
 clock = pygame.time.Clock()
-ROCK = np.array([0.5, 0.5, 0.5])  # Define ROCK color
+ROCK = np.array([0.5, 0.5, 0.5])  # Define ROCK colora
 # Terrain settings
-terrain_size = 1014
+terrain_size = 512
 scale = 0.002
 octaves = 8
 persistence = 0.5
@@ -26,7 +26,7 @@ camera_angle_x = 30
 camera_angle_y = 0
 
 @jit(nopython=True, parallel=True)
-def apply_erosion(terrain, iterations=60000):
+def apply_erosion(terrain, iterations=50000):
     eroded = terrain.copy()
     for _ in range(iterations):
         x, y = random.randint(1, terrain.shape[0]-2), random.randint(1, terrain.shape[1]-2)
@@ -39,7 +39,6 @@ def apply_erosion(terrain, iterations=60000):
                 eroded[ny, nx] += amount
     return eroded
 
-
 @jit(nopython=True)
 def calculate_normal(v1, v2, v3, v4):
     u = v2 - v1
@@ -50,6 +49,7 @@ def calculate_normal(v1, v2, v3, v4):
 def get_biome_color(height, moisture, snow_noise):
     # More realistic colors inspired by Norway's landscapes
     SNOW = np.array([0.9, 0.9, 0.9])
+    ROCK = np.array([0.5, 0.5, 0.5])  # Define ROCK color
     GRASS = np.array([0.3, 0.4, 0.3])
     FOREST = np.array([0.1, 0.3, 0.1])
     WATER = np.array([0.0, 0.1, 0.2])
@@ -72,6 +72,8 @@ def get_biome_color(height, moisture, snow_noise):
             return FOREST * t + GRASS * (1 - t)
     else:
         return WATER
+
+
 @jit(nopython=True)
 def apply_simple_lighting(color, normal):
     light_dir = np.array([0.5, 1, 0.5])
@@ -103,33 +105,21 @@ def generate_terrain():
             nx = x * scale
             ny = y * scale
             
-            # Create a base landscape with more water
             base = noise_at(nx, ny, octaves, persistence, lacunarity)
-            base = (base + 1) / 2  # Normalize to 0-1 range
-            base = np.power(base, 1.2)  # Increase water areas
-            
-            # Create smoother, less peaky mountains
-            mountain_range = noise_at(nx * 0.02, ny * 0.02, 2, 0.5, 2.0)
+            mountain_range = noise_at(nx * 0.1, ny * 0.1, 4, 0.5, 2.0)
             mountain_range = np.maximum(mountain_range, 0)
-            mountain_range = np.power(mountain_range, 3)  # Ensure steepness
-            
-            # Combine base and mountains
             combined = base * 0.3 + mountain_range * 0.7
-            
-            # Add some small-scale roughness
-            roughness = noise_at(nx * 8, ny * 8, 2, 0.5, 2.0) * 0.00001
+            roughness = noise_at(nx * 8, ny * 8, 2, 0.5, 2.0) * 0.05
             
             terrain[y, x] = combined + roughness
             moisture[y, x] = noise_at(nx * 0.05, ny * 0.05, 4, 0.5, 2.0)
 
     terrain = (terrain - terrain.min()) / (terrain.max() - terrain.min())
     moisture = (moisture - moisture.min()) / (moisture.max() - moisture.min())
-    
-    # Adjust the height scale to create more dramatic coastal features
-    terrain = np.power(terrain, 1.3) * 250
+    terrain = np.power(terrain, 1.5) * 200
 
-    # Apply erosion to smooth out peaks
-    terrain = apply_erosion(terrain, iterations=20000)
+    for _ in range(3):
+        terrain = apply_erosion(terrain)
 
     snow_noise = np.zeros((terrain_size, terrain_size), dtype=np.float32)
     for y in range(terrain_size):
@@ -173,6 +163,7 @@ for i in range(terrain_size - 1):
         
         vertices.extend([v1, v2, v3, v4])
         colors.extend([c1, c2, c3, c4])
+# ... (previous imports and initialization code remains the same)
 
 # Modified side wall generation with double-sided faces
 for i in range(terrain_size - 1):

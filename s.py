@@ -25,6 +25,9 @@ camera_distance = 1000
 camera_angle_x = 30
 camera_angle_y = 0
 
+# Sun settings
+sun_direction = np.array([0.5, 1, 0.5])  # Initial sun direction
+
 @jit(nopython=True, parallel=True)
 def apply_erosion(terrain, iterations=60000):
     eroded = terrain.copy()
@@ -39,7 +42,6 @@ def apply_erosion(terrain, iterations=60000):
                 eroded[ny, nx] += amount
     return eroded
 
-
 @jit(nopython=True)
 def calculate_normal(v1, v2, v3, v4):
     u = v2 - v1
@@ -48,15 +50,14 @@ def calculate_normal(v1, v2, v3, v4):
     return normal / np.linalg.norm(normal)
 
 def get_biome_color(height, moisture, snow_noise):
-    # More realistic colors inspired by Norway's landscapes
     SNOW = np.array([0.9, 0.9, 0.9])
+    ROCK = np.array([0.5, 0.5, 0.5])
     GRASS = np.array([0.3, 0.4, 0.3])
     FOREST = np.array([0.1, 0.3, 0.1])
     WATER = np.array([0.0, 0.1, 0.2])
 
     height = max(0, min(1, height))
     moisture = max(0, min(1, moisture))
-
     snow_threshold = 0.7 + snow_noise * 0.1 + np.random.uniform(-0.05, 0.05)
 
     if height > snow_threshold:
@@ -72,20 +73,19 @@ def get_biome_color(height, moisture, snow_noise):
             return FOREST * t + GRASS * (1 - t)
     else:
         return WATER
+
 @jit(nopython=True)
-def apply_simple_lighting(color, normal):
-    light_dir = np.array([0.5, 1, 0.5])
-    light_dir = light_dir / np.linalg.norm(light_dir)
-    
+def apply_simple_lighting(color, normal, sun_dir):
+    sun_dir = sun_dir / np.linalg.norm(sun_dir)
     ambient = 0.3
-    diffuse = max(0, np.dot(normal, light_dir))
-    
-    return color * (ambient + diffuse * 0.7)
+    diffuse = max(0, np.dot(normal, sun_dir))
+    shadow_strength = 0.5 if diffuse < 0.1 else 1  # Simple shadow effect
+    return color * (ambient + diffuse * 0.7) * shadow_strength
 
 def generate_terrain():
     seed = random.randint(0, 1000000)
     noise = OpenSimplex(seed=seed)
-    
+
     def noise_at(nx, ny, octaves, persistence, lacunarity):
         value = 0
         amplitude = 1
@@ -103,20 +103,15 @@ def generate_terrain():
             nx = x * scale
             ny = y * scale
             
-            # Create a base landscape with more water
             base = noise_at(nx, ny, octaves, persistence, lacunarity)
-            base = (base + 1) / 2  # Normalize to 0-1 range
-            base = np.power(base, 1.2)  # Increase water areas
+            base = (base + 1) / 2
+            base = np.power(base, 1.2)
             
-            # Create smoother, less peaky mountains
             mountain_range = noise_at(nx * 0.02, ny * 0.02, 2, 0.5, 2.0)
             mountain_range = np.maximum(mountain_range, 0)
-            mountain_range = np.power(mountain_range, 3)  # Ensure steepness
+            mountain_range = np.power(mountain_range, 3)
             
-            # Combine base and mountains
             combined = base * 0.3 + mountain_range * 0.7
-            
-            # Add some small-scale roughness
             roughness = noise_at(nx * 8, ny * 8, 2, 0.5, 2.0) * 0.00001
             
             terrain[y, x] = combined + roughness
@@ -124,11 +119,7 @@ def generate_terrain():
 
     terrain = (terrain - terrain.min()) / (terrain.max() - terrain.min())
     moisture = (moisture - moisture.min()) / (moisture.max() - moisture.min())
-    
-    # Adjust the height scale to create more dramatic coastal features
     terrain = np.power(terrain, 1.3) * 250
-
-    # Apply erosion to smooth out peaks
     terrain = apply_erosion(terrain, iterations=20000)
 
     snow_noise = np.zeros((terrain_size, terrain_size), dtype=np.float32)
@@ -151,7 +142,7 @@ colors = []
 for i in range(terrain_size - 1):
     for j in range(terrain_size - 1):
         x, z = i - terrain_size // 2, j - terrain_size // 2
-        y1, y2, y3, y4 = terrain[i,j], terrain[i+1,j], terrain[i+1,j+1], terrain[i,j+1]
+        y1, y2, y3, y4 = terrain[i, j], terrain[i + 1, j], terrain[i + 1, j + 1], terrain[i, j + 1]
         v1 = np.array([x, y1, -z])
         v2 = np.array([x + 1, y2, -z])
         v3 = np.array([x + 1, y3, -(z + 1)])
@@ -159,77 +150,14 @@ for i in range(terrain_size - 1):
         
         normal = calculate_normal(v1, v2, v3, v4)
         
-        # Calculate colors for each vertex
-        c1 = get_biome_color(y1/200, moisture[i,j], snow_noise[i,j])
-        c2 = get_biome_color(y2/200, moisture[i+1,j], snow_noise[i+1,j])
-        c3 = get_biome_color(y3/200, moisture[i+1,j+1], snow_noise[i+1,j+1])
-        c4 = get_biome_color(y4/200, moisture[i,j+1], snow_noise[i,j+1])
-        
-        # Apply simple lighting
-        c1 = apply_simple_lighting(c1, normal)
-        c2 = apply_simple_lighting(c2, normal)
-        c3 = apply_simple_lighting(c3, normal)
-        c4 = apply_simple_lighting(c4, normal)
+        c1 = apply_simple_lighting(get_biome_color(y1 / 200, moisture[i, j], snow_noise[i, j]), normal, sun_direction)
+        c2 = apply_simple_lighting(get_biome_color(y2 / 200, moisture[i + 1, j], snow_noise[i + 1, j]), normal, sun_direction)
+        c3 = apply_simple_lighting(get_biome_color(y3 / 200, moisture[i + 1, j + 1], snow_noise[i + 1, j + 1]), normal, sun_direction)
+        c4 = apply_simple_lighting(get_biome_color(y4 / 200, moisture[i, j + 1], snow_noise[i, j + 1]), normal, sun_direction)
         
         vertices.extend([v1, v2, v3, v4])
         colors.extend([c1, c2, c3, c4])
 
-# Modified side wall generation with double-sided faces
-for i in range(terrain_size - 1):
-    # Front side
-    x, z = i - terrain_size // 2, terrain_size // 2
-    y1, y2 = terrain[i, -1], terrain[i + 1, -1]
-    v1 = np.array([x, y1, -z])
-    v2 = np.array([x + 1, y2, -z])
-    v3 = np.array([x + 1, 0, -z])
-    v4 = np.array([x, 0, -z])
-    normal = calculate_normal(v1, v2, v3, v4)
-    rock_color = apply_simple_lighting(ROCK, normal)
-    # Add both faces - one for each side
-    vertices.extend([v1, v2, v3, v4])  # Outer face
-    vertices.extend([v4, v3, v2, v1])  # Inner face
-    colors.extend([rock_color] * 8)  # Colors for both faces
-
-    # Back side
-    z = -(terrain_size // 2)
-    y1, y2 = terrain[i, 0], terrain[i + 1, 0]
-    v1 = np.array([x, y1, -z])
-    v2 = np.array([x + 1, y2, -z])
-    v3 = np.array([x + 1, 0, -z])
-    v4 = np.array([x, 0, -z])
-    normal = calculate_normal(v1, v2, v3, v4)
-    rock_color = apply_simple_lighting(ROCK, normal)
-    vertices.extend([v1, v2, v3, v4])  # Outer face
-    vertices.extend([v4, v3, v2, v1])  # Inner face
-    colors.extend([rock_color] * 8)  # Colors for both faces
-
-for j in range(terrain_size - 1):
-    # Left side
-    x, z = -(terrain_size // 2), j - terrain_size // 2
-    y1, y2 = terrain[0, j], terrain[0, j + 1]
-    v1 = np.array([x, y1, -z])
-    v2 = np.array([x, y2, -(z + 1)])
-    v3 = np.array([x, 0, -(z + 1)])
-    v4 = np.array([x, 0, -z])
-    normal = calculate_normal(v1, v2, v3, v4)
-    rock_color = apply_simple_lighting(ROCK, normal)
-    vertices.extend([v1, v2, v3, v4])  # Outer face
-    vertices.extend([v4, v3, v2, v1])  # Inner face
-    colors.extend([rock_color] * 8)  # Colors for both faces
-
-    # Right side
-    x = terrain_size // 2
-    y1, y2 = terrain[-1, j], terrain[-1, j + 1]
-    v1 = np.array([x, y1, -z])
-    v2 = np.array([x, y2, -(z + 1)])
-    v3 = np.array([x, 0, -(z + 1)])
-    v4 = np.array([x, 0, -z])
-    normal = calculate_normal(v1, v2, v3, v4)
-    rock_color = apply_simple_lighting(ROCK, normal)
-    vertices.extend([v1, v2, v3, v4])  # Outer face
-    vertices.extend([v4, v3, v2, v1])  # Inner face
-    colors.extend([rock_color] * 8)  # Colors for both faces
-    
 vertices = np.array(vertices, dtype=np.float32)
 colors = np.array(colors, dtype=np.float32)
 print("Arrays created.")
@@ -254,6 +182,14 @@ while running:
         camera_angle_y -= 2
     if keys[pygame.K_d]:
         camera_angle_y += 2
+    if keys[pygame.K_UP]:
+        sun_direction[1] += 0.1  # Increase sun height
+    if keys[pygame.K_DOWN]:
+        sun_direction[1] -= 0.1  # Decrease sun height
+    if keys[pygame.K_LEFT]:
+        sun_direction[0] -= 0.1  # Move sun left
+    if keys[pygame.K_RIGHT]:
+        sun_direction[0] += 0.1  # Move sun right
 
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
     glLoadIdentity()

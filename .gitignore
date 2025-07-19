@@ -1,0 +1,5 @@
+# Ignore OBJ files and binaries
+C/*.obj
+C/terrain
+C/weather
+C/obj 

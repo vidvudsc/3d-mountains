@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # 3D Mountains Project
 
 This project generates and visualizes 3D terrain and simulates weather and erosion, with both C and Python implementations.
@@ -73,26 +72,3 @@ Both scripts generate and visualize 3D terrain with erosion and realistic colori
 - Binaries (`terrain`, `weather`, `obj`) are generated from their respective `.c` files.
 - The C programs use Raylib for graphics and input; Python uses PyOpenGL and pygame.
 - For more details on controls and features, see comments at the top of each source file. 
-
-
-gcc main.c \
-    -o terrain \
-    -I/opt/homebrew/include \
-    -L/opt/homebrew/lib \
-    -Wall -Wextra -Wshadow -Wpointer-arith -Wstrict-prototypes -Wmissing-prototypes -Wswitch-enum \
-    -O3 -march=native -flto -DNDEBUG \
-    -lraylib -lm \
-    -framework OpenGL -framework Cocoa -framework IOKit \
-    -framework CoreAudio -framework CoreVideo \
-    -std=c99
-
-
-
-to run
-
-
-
-
-=======
-# 3d-mountains
->>>>>>> c3ba1a704703034d41e3d99b3ee7e19673f849fc

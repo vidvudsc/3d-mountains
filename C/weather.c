@@ -1,509 +1,745 @@
-// terrain_weather_sim.c (Corrected & Hardened Version)
-// Build (Linux/macOS): clang -O2 -std=c99 terrain_weather_sim.c -lraylib -lm -lpthread -ldl -lrt -lX11 -o weather
-// macOS (homebrew raylib): clang -O2 -std=c99 terrain_weather_sim.c -lraylib -framework IOKit -framework Cocoa -framework OpenGL -o weather
-// Windows (MinGW example): gcc -O2 -std=c99 terrain_weather_sim.c -lraylib -lopengl32 -lgdi32 -lwinmm -o weather.exe
-//
-// This program loads an OBJ terrain mesh, builds a heightfield, and runs a lightweight layered
-// atmospheric simulation (wind, temperature, humidity, clouds, precipitation) for visual
-// experimentation. Emphasis: *qualitatively plausible* rather than physically exact.
-//
-// Controls:
-//   Mouse Wheel   : Zoom camera distance
-//   Left/Right    : Orbit camera
-//   W             : Toggle terrain wireframe
-//   1 / 2 / 3     : Select overlay (Temperature / Humidity / Cloud Water)
-//   4             : Toggle wind vectors
-//   SPACE (hold)  : Inject surface moisture under cursor
-//   R             : Reset simulation
-//   +/- or = / -  : Adjust time scale
-//   ESC           : Quit
-//
-// Notes:
-// * Assumes OBJ X,Z extents define a roughly rectangular area. We normalize to a GRID_W x GRID_H grid.
-// * Height values are vertically exaggerated (TERRAIN_VERTICAL_SCALE) consistently in mesh & heightfield.
-// * Semi-Lagrangian advection used for stability.
-// * All units for horizontal grid assume 1 cell = arbitrary distance (scaled from model bounds). If you
-//   want real meters, set CELL_SIZE accordingly and adjust wind speeds.
-//
-// Recommended next steps (optional):
-//   - Introduce separate physical scaling for meters per cell
-//   - Add pressure gradient force for dynamic wind evolution
-//   - Move update to a fixed timestep accumulator
-//   - GPU compute (shader storage buffer or textures) for >512 grids
-//
-// --------------------------------------------------------------------------------------------
+// weather.c — volumetric weather with slice-based rendering over terrain
+// Build (macOS/Homebrew):
+// clang -std=c11 -O2 weather.c -o weather \
+//   -I/opt/homebrew/include -L/opt/homebrew/lib -lraylib \
+//   -framework Cocoa -framework IOKit -framework CoreVideo -framework OpenGL
 
 #include "raylib.h"
 #include "raymath.h"
 #include "rlgl.h"
+
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
-#include <float.h>
-#include <stdbool.h>
 
-// ---------------- Configuration ----------------
-#define GRID_W 256
-#define GRID_H 256
-#define LAYERS 3
+// --- small helpers ---
+static inline float clampf(float v, float lo, float hi) { return (v < lo) ? lo : (v > hi ? hi : v); }
+static inline int   clampi(int   v, int   lo, int   hi) { return (v < lo) ? lo : (v > hi ? hi : v); }
 
-static const float LAYER_THICKNESS = 200.0f;          // Approx height of each atmospheric slab (m)
-static const float TERRAIN_VERTICAL_SCALE = 1.5f;      // Vertical exaggeration applied uniformly
+// ---------- Domain & grid ----------
+#define TERRAIN_SIZE_X 256
+#define TERRAIN_SIZE_Z 256
 
-// Simulation parameters (tunable)
-static float BASE_SEA_LEVEL_TEMP   = 20.0f;            // °C
-static float LAPSE_RATE            = 6.5f / 1000.0f;   // °C per meter
-static float CONDENSE_RATE         = 0.5f;             // Fraction of supersaturation condensed per step
-static float RAIN_THRESHOLD        = 0.3f;             // Cloud water threshold for precipitation
-static float RAIN_RATE             = 0.05f;            // Fraction of excess cloud removed as rain
-static float LATENT_HEAT_FACTOR    = 0.1f;             // Heating on condensation
-static float EVAP_COOLING          = 0.05f;            // Cooling from precipitation
-static float DIURNAL_AMPLITUDE     = 4.0f;             // Surface diurnal temperature swing (°C peak-to-mid)
-static float TIME_SCALE            = 600.0f;           // Simulated seconds per real second
-static float WIND_BASE_U           = 8.0f;             // Initial west->east base wind (m/s)
-static float WIND_BASE_V           = 2.0f;             // Initial south->north base wind (m/s)
-static float OROGRAPHIC_SCALE      = 0.01f;            // Scaling for vertical velocity from slope
-static float ADIABATIC_COOL_DRY    = 9.8f / 1000.0f;   // Dry adiabatic lapse for vertical motion (°C/m)
-static float MOISTURE_INJECT_AMOUNT= 0.2f;             // Added q when injecting moisture
+#define NX 48
+#define NY 32
+#define NZ 48
 
-// Visual toggles
-static int showTemp  = 1;
-static int showHum   = 0;
-static int showCloud = 1;
-static int showWind  = 1;
+#define WORLD_TOP_Y 160.0f
 
-// Data structures
+static const float DX = (float)TERRAIN_SIZE_X / (float)NX;
+static const float DZ = (float)TERRAIN_SIZE_Z / (float)NZ;
+static const float DY = WORLD_TOP_Y / (float)NY;
 
-typedef struct {
-    float height;          // Surface height (m)
-    float T[LAYERS];       // Temperature per layer (°C)
-    float q[LAYERS];       // Specific humidity-like scalar (arbitrary units)
-    float cloud[LAYERS];   // Cloud water mixing ratio
-} Cell;
+// ---------- Simulation tuning ----------
+static float g_dt = 0.08f;
+static int   g_substeps = 1;
+static float g_visc = 0.0008f;
+static float g_diff = 0.0005f;
+static float g_buoyancyT = 0.80f;
+static float g_buoyancyH = 0.10f;
+static float g_windInflow = 0.8f;
+static float g_inflowHumidity = 0.60f;   // moist air at -X inflow
+static float g_groundEvap = 0.020f;      // near-ground evaporation per second
+static float g_evapHeight = 2.0f;        // in world units
+static int   g_jacobiIters = 18;
 
-typedef struct {
-    float u[LAYERS];       // Wind X (grid units / s)
-    float v[LAYERS];       // Wind Z (grid units / s)
-    float w[LAYERS];       // Diagnostic vertical velocity (m/s)
-} FlowCell;
+// ---------- Visualization ----------
+static int   g_mode = 1; // 1=temp, 2=humidity, 3=clouds
+static int   g_drawStep = 2; // cube debug step
+static bool  g_wireframeTerrain = false;
+static bool  g_debugCubes = false; // toggle cubes
 
-static Cell      grid[GRID_W * GRID_H];
-static FlowCell  flowField[GRID_W * GRID_H];
-static float     advectT[LAYERS][GRID_W * GRID_H];
-static float     advectQ[LAYERS][GRID_W * GRID_H];
-static float     advectC[LAYERS][GRID_W * GRID_H];
-static float     heightField[GRID_W * GRID_H];
+// ---------- Terrain heightmap ----------
+static float terrainH[TERRAIN_SIZE_X][TERRAIN_SIZE_Z];
+static float terrainMinY = 0.0f, terrainMaxY = 0.0f;
 
-static inline int IDX(int x, int y) { return y * GRID_W + x; }
+static bool LoadTerrainHeightFromOBJ(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+    for (int z=0; z<TERRAIN_SIZE_Z; ++z)
+        for (int x=0; x<TERRAIN_SIZE_X; ++x)
+            terrainH[x][z] = 0.0f;
+    terrainMinY = 1e9f; terrainMaxY = -1e9f;
 
-// ---------------- Utility Functions ----------------
-static float SampleBilinear(float *field, float x, float z) {
-    if (x < 0) x = 0; if (z < 0) z = 0;
-    if (x > GRID_W - 1) x = GRID_W - 1;
-    if (z > GRID_H - 1) z = GRID_H - 1;
-    int x0 = (int)x; int z0 = (int)z;
-    int x1 = x0 + 1; if (x1 >= GRID_W) x1 = x0;
-    int z1 = z0 + 1; if (z1 >= GRID_H) z1 = z0;
-    float tx = x - x0; float tz = z - z0;
-    float f00 = field[IDX(x0,z0)];
-    float f10 = field[IDX(x1,z0)];
-    float f01 = field[IDX(x0,z1)];
-    float f11 = field[IDX(x1,z1)];
-    float a = f00 + (f10 - f00) * tx;
-    float b = f01 + (f11 - f01) * tx;
-    return a + (b - a) * tz;
-}
-
-static float Saturation(float T) { // Tetens approximation proxy
-    float es = 6.1078f * expf((17.269f * T) / (T + 237.3f));
-    return es; // treat as capacity measure
-}
-
-// ---------------- Model / Heightfield Loader ----------------
-static Model LoadOBJBuildHeight(const char *filename) {
-    Model model = LoadModel(filename);
-    if (model.meshCount == 0) {
-        TraceLog(LOG_ERROR, "LoadModel -> meshCount=0 (%s). Using fallback plane.", filename);
-        Mesh plane = GenMeshPlane((float)(GRID_W - 1), (float)(GRID_H - 1), 2, 2);
-        model = LoadModelFromMesh(plane);
-    }
-
-    Mesh *mesh = &model.meshes[0];
-    if (mesh->vertexCount == 0 || mesh->vertices == NULL) {
-        TraceLog(LOG_ERROR, "Primary mesh empty. Flat heightfield.");
-        for (int i = 0; i < GRID_W * GRID_H; ++i) heightField[i] = 0.0f;
-        return model;
-    }
-
-    float minX = FLT_MAX, maxX = -FLT_MAX, minZ = FLT_MAX, maxZ = -FLT_MAX;
-    for (int i = 0; i < mesh->vertexCount; ++i) {
-        float vx = mesh->vertices[i*3 + 0];
-        float vz = mesh->vertices[i*3 + 2];
-        if (vx < minX) minX = vx; if (vx > maxX) maxX = vx;
-        if (vz < minZ) minZ = vz; if (vz > maxZ) maxZ = vz;
-    }
-    if (minX >= maxX) maxX = minX + 1.0f;
-    if (minZ >= maxZ) maxZ = minZ + 1.0f;
-    float invSpanX = 1.0f / (maxX - minX);
-    float invSpanZ = 1.0f / (maxZ - minZ);
-
-    for (int i = 0; i < GRID_W * GRID_H; ++i) heightField[i] = -FLT_MAX;
-
-    for (int i = 0; i < mesh->vertexCount; ++i) {
-        float vx = mesh->vertices[i*3 + 0];
-        float vy = mesh->vertices[i*3 + 1] * TERRAIN_VERTICAL_SCALE;
-        float vz = mesh->vertices[i*3 + 2];
-        int gx = (int)((vx - minX) * invSpanX * (GRID_W - 1) + 0.5f);
-        int gz = (int)((vz - minZ) * invSpanZ * (GRID_H - 1) + 0.5f);
-        if (gx >= 0 && gx < GRID_W && gz >= 0 && gz < GRID_H) {
-            float *cellH = &heightField[IDX(gx,gz)];
-            if (vy > *cellH) *cellH = vy;
-        }
-    }
-    // Fill holes
-    for (int iter = 0; iter < 6; ++iter) {
-        for (int z = 1; z < GRID_H - 1; ++z) {
-            for (int x = 1; x < GRID_W - 1; ++x) {
-                int id = IDX(x,z);
-                if (heightField[id] < -1e5f) {
-                    float sum = 0, cnt = 0;
-                    for (int dz = -1; dz <= 1; ++dz)
-                        for (int dx = -1; dx <= 1; ++dx) {
-                            int nid = IDX(x+dx,z+dz);
-                            float h = heightField[nid];
-                            if (h > -1e5f) { sum += h; cnt += 1; }
-                        }
-                    if (cnt > 0) heightField[id] = sum / cnt;
+    char line[512];
+    int cnt = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0]=='v' && line[1]==' ') {
+            float vx, vy, vz;
+            if (sscanf(line, "v %f %f %f", &vx, &vy, &vz) == 3) {
+                int ix = (int)floorf(vx + 0.5f);
+                int iz = (int)floorf(vz + 0.5f);
+                if (ix>=0 && ix<TERRAIN_SIZE_X && iz>=0 && iz<TERRAIN_SIZE_Z) {
+                    if (vy > terrainH[ix][iz]) terrainH[ix][iz] = vy;
+                    if (vy < terrainMinY) terrainMinY = vy;
+                    if (vy > terrainMaxY) terrainMaxY = vy;
+                    cnt++;
                 }
             }
         }
     }
-    for (int i = 0; i < GRID_W * GRID_H; ++i) if (heightField[i] < -1e5f) heightField[i] = 0.0f;
-
-    // Apply vertical scale to actual mesh vertices so drawing matches heightfield
-    for (int i = 0; i < mesh->vertexCount; ++i) mesh->vertices[i*3 + 1] *= TERRAIN_VERTICAL_SCALE;
-    UploadMesh(mesh, false);
-
-    TraceLog(LOG_INFO, "Heightfield built: X:[%.2f, %.2f] Z:[%.2f, %.2f]", minX, maxX, minZ, maxZ);
-    return model;
+    fclose(f);
+    return cnt > 0;
 }
 
-// ---------------- Simulation Initialization ----------------
-static void Weather_Reset(void) {
-    for (int z = 0; z < GRID_H; ++z) {
-        for (int x = 0; x < GRID_W; ++x) {
-            int i = IDX(x,z);
-            float h = heightField[i];
-            grid[i].height = h;
-            for (int L = 0; L < LAYERS; ++L) {
-                float layerAlt = h + (L + 0.5f) * LAYER_THICKNESS;
-                float baseT = BASE_SEA_LEVEL_TEMP - LAPSE_RATE * layerAlt;
-                grid[i].T[L] = baseT;
-                grid[i].q[L] = 0.6f - 0.1f * (float)L * 0.5f; // Slightly drier aloft
-                if (grid[i].q[L] < 0.1f) grid[i].q[L] = 0.1f;
-                grid[i].cloud[L] = 0.0f;
-                flowField[i].u[L] = WIND_BASE_U * (1.0f - 0.1f * L);
-                flowField[i].v[L] = WIND_BASE_V * (1.0f - 0.1f * L);
-                flowField[i].w[L] = 0.0f;
-            }
+// Bilinear height sample in world coords
+static inline float SampleTerrainHeightBilinear(float wx, float wz) {
+    float x = clampf(wx, 0.0f, (float)TERRAIN_SIZE_X - 1.0f);
+    float z = clampf(wz, 0.0f, (float)TERRAIN_SIZE_Z - 1.0f);
+    int x0 = (int)floorf(x), z0 = (int)floorf(z);
+    int x1 = (x0+1 < TERRAIN_SIZE_X) ? x0+1 : x0;
+    int z1 = (z0+1 < TERRAIN_SIZE_Z) ? z0+1 : z0;
+    float fx = x - x0, fz = z - z0;
+    float h00 = terrainH[x0][z0], h10 = terrainH[x1][z0];
+    float h01 = terrainH[x0][z1], h11 = terrainH[x1][z1];
+    float hx0 = h00*(1.0f-fx) + h10*fx;
+    float hx1 = h01*(1.0f-fx) + h11*fx;
+    return hx0*(1.0f-fz) + hx1*fz;
+}
+
+// Build a shaded terrain model from heightmap (robust vs OBJ loader)
+static Model BuildTerrainModelFromHeight(void) {
+    const int W=TERRAIN_SIZE_X, H=TERRAIN_SIZE_Z;
+    const int vcount=W*H;
+    const int icount=(W-1)*(H-1)*6;
+
+    Mesh mesh = (Mesh){0};
+    mesh.vertexCount = vcount;
+    mesh.triangleCount = icount/3;
+    mesh.vertices = (float*)MemAlloc(vcount*3*sizeof(float));
+    mesh.normals  = (float*)MemAlloc(vcount*3*sizeof(float));
+    mesh.colors   = (unsigned char*)MemAlloc(vcount*4*sizeof(unsigned char));
+    mesh.indices  = (unsigned short*)MemAlloc(icount*sizeof(unsigned short));
+
+    for (int z=0; z<H; ++z) for (int x=0; x<W; ++x) {
+        int i = z*W + x;
+        float y = terrainH[x][z];
+        mesh.vertices[i*3+0] = (float)x;
+        mesh.vertices[i*3+1] = y;
+        mesh.vertices[i*3+2] = (float)z;
+        mesh.normals[i*3+0] = mesh.normals[i*3+1] = mesh.normals[i*3+2] = 0.0f;
+    }
+    int idx=0;
+    for (int z=0; z<H-1; ++z) for (int x=0; x<W-1; ++x) {
+        int i0=z*W+x, i1=i0+1, i2=i0+W, i3=i2+1;
+        mesh.indices[idx++]=i0; mesh.indices[idx++]=i2; mesh.indices[idx++]=i1;
+        mesh.indices[idx++]=i1; mesh.indices[idx++]=i2; mesh.indices[idx++]=i3;
+    }
+    for (int t=0; t<icount; t+=3) {
+        int i0=mesh.indices[t], i1=mesh.indices[t+1], i2=mesh.indices[t+2];
+        Vector3 v0={mesh.vertices[i0*3+0],mesh.vertices[i0*3+1],mesh.vertices[i0*3+2]};
+        Vector3 v1={mesh.vertices[i1*3+0],mesh.vertices[i1*3+1],mesh.vertices[i1*3+2]};
+        Vector3 v2={mesh.vertices[i2*3+0],mesh.vertices[i2*3+1],mesh.vertices[i2*3+2]};
+        Vector3 n = Vector3Normalize(Vector3CrossProduct(Vector3Subtract(v1,v0), Vector3Subtract(v2,v0)));
+        mesh.normals[i0*3+0]+=n.x; mesh.normals[i0*3+1]+=n.y; mesh.normals[i0*3+2]+=n.z;
+        mesh.normals[i1*3+0]+=n.x; mesh.normals[i1*3+1]+=n.y; mesh.normals[i1*3+2]+=n.z;
+        mesh.normals[i2*3+0]+=n.x; mesh.normals[i2*3+1]+=n.y; mesh.normals[i2*3+2]+=n.z;
+    }
+    for (int i=0; i<vcount; ++i) {
+        Vector3 n = Vector3Normalize((Vector3){mesh.normals[i*3+0],mesh.normals[i*3+1],mesh.normals[i*3+2]});
+        mesh.normals[i*3+0]=n.x; mesh.normals[i*3+1]=n.y; mesh.normals[i*3+2]=n.z;
+        float shade = Clamp(Vector3DotProduct(n, Vector3Normalize((Vector3){0.35f,1.0f,0.45f})), 0.0f, 1.0f);
+        float slope = 1.0f - Vector3DotProduct(n,(Vector3){0,1,0}); slope = clampf(slope,0.0f,1.0f);
+        Color base = (slope > 0.35f)?(Color){110,95,85,255}:(Color){55,120,50,255};
+        mesh.colors[i*4+0]=(unsigned char)(base.r*(0.3f+0.7f*shade));
+        mesh.colors[i*4+1]=(unsigned char)(base.g*(0.3f+0.7f*shade));
+        mesh.colors[i*4+2]=(unsigned char)(base.b*(0.3f+0.7f*shade));
+        mesh.colors[i*4+3]=255;
+    }
+    UploadMesh(&mesh, true);
+    return LoadModelFromMesh(mesh);
+}
+
+// ---------- Fields ----------
+static float *U,*V,*W,*U0,*V0,*W0,*T,*T0,*H,*H0,*C,*C0,*P,*Div;
+static unsigned char *Solid;
+
+static inline int idx3(int i,int j,int k){ return i + NX*(k + NZ*j); }
+
+static void AllocateFields(void){
+    size_t N=(size_t)NX*NY*NZ;
+    U=MemAlloc(N*sizeof(float)); V=MemAlloc(N*sizeof(float)); W=MemAlloc(N*sizeof(float));
+    U0=MemAlloc(N*sizeof(float)); V0=MemAlloc(N*sizeof(float)); W0=MemAlloc(N*sizeof(float));
+    T=MemAlloc(N*sizeof(float)); T0=MemAlloc(N*sizeof(float));
+    H=MemAlloc(N*sizeof(float)); H0=MemAlloc(N*sizeof(float));
+    C=MemAlloc(N*sizeof(float)); C0=MemAlloc(N*sizeof(float));
+    P=MemAlloc(N*sizeof(float)); Div=MemAlloc(N*sizeof(float));
+    Solid=MemAlloc(N*sizeof(unsigned char));
+}
+static void FreeFields(void){
+    MemFree(U); MemFree(V); MemFree(W);
+    MemFree(U0); MemFree(V0); MemFree(W0);
+    MemFree(T); MemFree(T0);
+    MemFree(H); MemFree(H0);
+    MemFree(C); MemFree(C0);
+    MemFree(P); MemFree(Div);
+    MemFree(Solid);
+}
+
+static void ResetFields(void){
+    for(int j=0;j<NY;++j) for(int k=0;k<NZ;++k) for(int i=0;i<NX;++i){
+        int id=idx3(i,j,k);
+        float x=(i+0.5f)*DX, y=(j+0.5f)*DY, z=(k+0.5f)*DZ;
+        float terr = SampleTerrainHeightBilinear(x,z);
+        Solid[id] = (y <= terr) ? 1 : 0;
+
+        U[id]=V[id]=W[id]=0.0f; P[id]=0.0f;
+
+        float tBase = 0.85f - 0.65f*(y/WORLD_TOP_Y);
+        float valleyBoost = (terr < (terrainMinY + 0.25f*(terrainMaxY-terrainMinY)))? 0.04f : 0.0f;
+        T[id] = clampf(tBase + valleyBoost, 0.0f, 1.0f);
+
+        float hBase = 0.35f - 0.25f*(y/WORLD_TOP_Y);
+        float valleyHum = (terr < (terrainMinY + 0.35f*(terrainMaxY-terrainMinY)))? 0.25f : 0.0f;
+        H[id] = clampf(hBase + valleyHum, 0.0f, 1.0f);
+        C[id] = 0.0f;
+    }
+}
+
+// ---------- Boundary/obstacles ----------
+static void EnforceSolids(float *u,float *v,float *w){
+    for(int j=0;j<NY;++j) for(int k=0;k<NZ;++k) for(int i=0;i<NX;++i){
+        int id=idx3(i,j,k);
+        if(Solid[id]) { u[id]=v[id]=w[id]=0.0f; continue; }
+        if(i>0    && Solid[idx3(i-1,j,k)]) u[id]=fminf(u[id],0.0f);
+        if(i<NX-1 && Solid[idx3(i+1,j,k)]) u[id]=fmaxf(u[id],0.0f);
+        if(j>0    && Solid[idx3(i,j-1,k)]) v[id]=fminf(v[id],0.0f);
+        if(j<NY-1 && Solid[idx3(i,j+1,k)]) v[id]=fmaxf(v[id],0.0f);
+        if(k>0    && Solid[idx3(i,j,k-1)]) w[id]=fminf(w[id],0.0f);
+        if(k<NZ-1 && Solid[idx3(i,j,k+1)]) w[id]=fmaxf(w[id],0.0f);
+    }
+    for(int j=0;j<NY;++j) for(int k=0;k<NZ;++k) {
+        U[idx3(0,j,k)]=fmaxf(U[idx3(0,j,k)],0.0f);
+        U[idx3(NX-1,j,k)]=fminf(U[idx3(NX-1,j,k)],0.0f);
+    }
+    for(int i=0;i<NX;++i) for(int k=0;k<NZ;++k) {
+        V[idx3(i,0,k)]=fmaxf(V[idx3(i,0,k)],0.0f);
+        V[idx3(i,NY-1,k)]=fminf(V[idx3(i,NY-1,k)],0.0f);
+    }
+    for(int i=0;i<NX;++i) for(int j=0;j<NY;++j) {
+        W[idx3(i,j,0)]=fmaxf(W[idx3(i,j,0)],0.0f);
+        W[idx3(i,j,NZ-1)]=fminf(W[idx3(i,j,NZ-1)],0.0f);
+    }
+}
+
+// ---------- Operators ----------
+static void AddBuoyancy(float *v,float *temp,float *hum,float dt){
+    for(int id=0; id<NX*NY*NZ; ++id){
+        if(Solid[id]) continue;
+        float force = g_buoyancyT*(temp[id]-0.4f) - g_buoyancyH*hum[id];
+        v[id] += force * dt;
+    }
+}
+
+static void AddInflow(float *u, float *hum){
+    // velocity inflow
+    for (int j=0;j<NY;++j) for (int k=0;k<NZ;++k) for (int i=0;i<2;++i) {
+        int id=idx3(i,j,k);
+        if(!Solid[id]) u[id]=fmaxf(u[id], g_windInflow);
+    }
+    // humidity inflow (keep moist at boundary)
+    for (int j=0;j<NY;++j) for (int k=0;k<NZ;++k) {
+        int id=idx3(0,j,k);
+        if(!Solid[id]) hum[id] = fmaxf(hum[id], g_inflowHumidity);
+    }
+}
+
+static void AddGroundEvaporation(float *hum, float dt){
+    for(int j=0;j<NY;++j) for(int k=0;k<NZ;++k) for(int i=0;i<NX;++i){
+        int id=idx3(i,j,k);
+        if(Solid[id]) continue;
+        float x=(i+0.5f)*DX, y=(j+0.5f)*DY, z=(k+0.5f)*DZ;
+        float terr = SampleTerrainHeightBilinear(x,z);
+        float d = y - terr;
+        if (d>0.0f && d < g_evapHeight) {
+            float w = 1.0f - (d / g_evapHeight); // stronger at ground
+            hum[id] = clampf(hum[id] + g_groundEvap * w * dt, 0.0f, 1.0f);
         }
     }
 }
 
-// ---------------- Simulation Core ----------------
-static void Weather_ComputeVertical(void) {
-    for (int z = 1; z < GRID_H - 1; ++z) {
-        for (int x = 1; x < GRID_W - 1; ++x) {
-            int i = IDX(x,z);
-            float hx1 = heightField[IDX(x+1,z)];
-            float hx0 = heightField[IDX(x-1,z)];
-            float hz1 = heightField[IDX(x,z+1)];
-            float hz0 = heightField[IDX(x,z-1)];
-            float slopeX = (hx1 - hx0) * 0.5f;   // d(height)/dx
-            float slopeZ = (hz1 - hz0) * 0.5f;   // d(height)/dz
-            for (int L = 0; L < LAYERS; ++L) {
-                float u = flowField[i].u[L];
-                float v = flowField[i].v[L];
-                flowField[i].w[L] = (u * slopeX + v * slopeZ) * OROGRAPHIC_SCALE; // Exaggerated vertical
-            }
+static void Diffuse(float *dst,const float *src,float diff,float dt,int iters,int isVel){
+    float a = dt*diff/(DX*DX);
+    for(int id=0; id<NX*NY*NZ; ++id) dst[id]=src[id];
+    for(int it=0; it<iters; ++it){
+        for(int j=1;j<NY-1;++j) for(int k=1;k<NZ-1;++k) for(int i=1;i<NX-1;++i){
+            int id=idx3(i,j,k);
+            if(Solid[id]){ dst[id]=0.0f; continue; }
+            float sum = dst[idx3(i-1,j,k)]+dst[idx3(i+1,j,k)]
+                      + dst[idx3(i,j-1,k)]+dst[idx3(i,j+1,k)]
+                      + dst[idx3(i,j,k-1)]+dst[idx3(i,j,k+1)];
+            dst[id]=(src[id]+a*sum)/(1.0f+6.0f*a);
         }
+        if(isVel) EnforceSolids(dst,dst,dst);
     }
 }
 
-static void Weather_Advection(float dt) {
-    for (int L = 0; L < LAYERS; ++L) {
-        for (int i = 0; i < GRID_W * GRID_H; ++i) {
-            advectT[L][i] = grid[i].T[L];
-            advectQ[L][i] = grid[i].q[L];
-            advectC[L][i] = grid[i].cloud[L];
-        }
-    }
-    for (int z = 0; z < GRID_H; ++z) {
-        for (int x = 0; x < GRID_W; ++x) {
-            int i = IDX(x,z);
-            for (int L = 0; L < LAYERS; ++L) {
-                float u = flowField[i].u[L];
-                float v = flowField[i].v[L];
-                float x_prev = x - u * dt; // cell size = 1
-                float z_prev = z - v * dt;
-                grid[i].T[L]     = SampleBilinear(advectT[L], x_prev, z_prev);
-                grid[i].q[L]     = SampleBilinear(advectQ[L], x_prev, z_prev);
-                grid[i].cloud[L] = SampleBilinear(advectC[L], x_prev, z_prev);
-            }
-        }
-    }
+static inline float sampleScalar(const float* s, float x,float y,float z){
+    int i0=clampi((int)floorf(x),0,NX-1), j0=clampi((int)floorf(y),0,NY-1), k0=clampi((int)floorf(z),0,NZ-1);
+    int i1=clampi(i0+1,0,NX-1), j1=clampi(j0+1,0,NY-1), k1=clampi(k0+1,0,NZ-1);
+    float fx=clampf(x-i0,0,1), fy=clampf(y-j0,0,1), fz=clampf(z-k0,0,1);
+    float c000=s[idx3(i0,j0,k0)], c100=s[idx3(i1,j0,k0)];
+    float c010=s[idx3(i0,j1,k0)], c110=s[idx3(i1,j1,k0)];
+    float c001=s[idx3(i0,j0,k1)], c101=s[idx3(i1,j0,k1)];
+    float c011=s[idx3(i0,j1,k1)], c111=s[idx3(i1,j1,k1)];
+    float c00=c000*(1-fx)+c100*fx, c10=c010*(1-fx)+c110*fx;
+    float c01=c001*(1-fx)+c101*fx, c11=c011*(1-fx)+c111*fx;
+    float c0=c00*(1-fy)+c10*fy, c1=c01*(1-fy)+c11*fy;
+    return c0*(1-fz)+c1*fz;
+}
+static inline Vector3 sampleVelocity(const float* u,const float* v,const float* w,float x,float y,float z){
+    return (Vector3){ sampleScalar(u,x,y,z), sampleScalar(v,x,y,z), sampleScalar(w,x,y,z) };
 }
 
-static void Weather_LocalPhysics(float dt, float simTime) {
-    float dayFrac = fmodf(simTime / 86400.0f, 1.0f); // 0..1
-    float diurnal = sinf(dayFrac * 2.0f * PI);       // -1..1
-    for (int i = 0; i < GRID_W * GRID_H; ++i) {
-        for (int L = 0; L < LAYERS; ++L) {
-            float *T = &grid[i].T[L];
-            float *q = &grid[i].q[L];
-            float *c = &grid[i].cloud[L];
-            float w  = flowField[i].w[L];
-            *T -= w * dt * ADIABATIC_COOL_DRY; // vertical motion cooling/heating
-            float layerFactor = 1.0f - 0.3f * L; // weaker diurnal higher up
-            *T += diurnal * (DIURNAL_AMPLITUDE * layerFactor) * dt * 0.001f; // scaled small per step
-            float qs = Saturation(*T);
-            if (*q > qs) { // condensation
-                float excess = (*q - qs) * CONDENSE_RATE;
-                *q -= excess; *c += excess; *T += LATENT_HEAT_FACTOR * excess;
-            }
-            if (*c > RAIN_THRESHOLD) { // precipitation
-                float rain = (*c - RAIN_THRESHOLD) * RAIN_RATE;
-                *c -= rain; *q -= rain * 0.2f; *T -= EVAP_COOLING * rain;
-                if (*q < 0) *q = 0;
-            }
-        }
+static void AdvectScalarField(float *dst,const float *src,const float *u,const float *v,const float *w,float dt){
+    for(int j=0;j<NY;++j) for(int k=0;k<NZ;++k) for(int i=0;i<NX;++i){
+        int id=idx3(i,j,k);
+        if(Solid[id]){ dst[id]=0.0f; continue; }
+        float vx=u[id]/DX, vy=v[id]/DY, vz=w[id]/DZ;
+        float x=i - dt*vx, y=j - dt*vy, z=k - dt*vz;
+        dst[id]=sampleScalar(src, clampf(x,0,NX-1), clampf(y,0,NY-1), clampf(z,0,NZ-1));
     }
 }
-
-static void Weather_Step(float dtSim, float simTime) {
-    Weather_ComputeVertical();
-    Weather_Advection(dtSim);
-    Weather_LocalPhysics(dtSim, simTime);
+static void AdvectVelocityField(float *un,float *vn,float *wn,const float *u,const float *v,const float *w,float dt){
+    for(int j=0;j<NY;++j) for(int k=0;k<NZ;++k) for(int i=0;i<NX;++i){
+        int id=idx3(i,j,k);
+        if(Solid[id]){ un[id]=vn[id]=wn[id]=0.0f; continue; }
+        float vx=u[id]/DX, vy=v[id]/DY, vz=w[id]/DZ;
+        float x=i - dt*vx, y=j - dt*vy, z=k - dt*vz;
+        Vector3 vel=sampleVelocity(u,v,w, clampf(x,0,NX-1), clampf(y,0,NY-1), clampf(z,0,NZ-1));
+        un[id]=vel.x; vn[id]=vel.y; wn[id]=vel.z;
+    }
+    EnforceSolids(un,vn,wn);
 }
 
-static void Weather_InjectMoisture(int gx, int gz, float radius) {
-    for (int z = gz - (int)radius; z <= gz + (int)radius; ++z) {
-        if (z < 0 || z >= GRID_H) continue;
-        for (int x = gx - (int)radius; x <= gx + (int)radius; ++x) {
-            if (x < 0 || x >= GRID_W) continue;
-            float dx = x - gx; float dz = z - gz; float d2 = dx*dx + dz*dz; float r2 = radius*radius;
-            if (d2 <= r2) {
-                int i = IDX(x,z);
-                float factor = 1.0f - d2 / r2;
-                grid[i].q[0] += MOISTURE_INJECT_AMOUNT * factor;
-                if (grid[i].q[0] > 2.0f) grid[i].q[0] = 2.0f;
-            }
+static void ComputeDivergence(const float *u,const float *v,const float *w){
+    const float inv2dx=0.5f/DX, inv2dy=0.5f/DY, inv2dz=0.5f/DZ;
+    for(int j=1;j<NY-1;++j) for(int k=1;k<NZ-1;++k) for(int i=1;i<NX-1;++i){
+        int id=idx3(i,j,k);
+        if(Solid[id]){ Div[id]=0.0f; continue; }
+        float du=u[idx3(i+1,j,k)]-u[idx3(i-1,j,k)];
+        float dv=v[idx3(i,j+1,k)]-v[idx3(i,j-1,k)];
+        float dw=w[idx3(i,j,k+1)]-w[idx3(i,j,k-1)];
+        Div[id]=inv2dx*du + inv2dy*dv + inv2dz*dw;
+    }
+}
+static void SolvePressure(void){
+    for(int id=0; id<NX*NY*NZ; ++id) if(Solid[id]) P[id]=0.0f;
+    for(int it=0; it<g_jacobiIters; ++it){
+        for(int j=1;j<NY-1;++j) for(int k=1;k<NZ-1;++k) for(int i=1;i<NX-1;++i){
+            int id=idx3(i,j,k);
+            if(Solid[id]){ P[id]=0.0f; continue; }
+            float sum=P[idx3(i-1,j,k)]+P[idx3(i+1,j,k)]
+                     +P[idx3(i,j-1,k)]+P[idx3(i,j+1,k)]
+                     +P[idx3(i,j,k-1)]+P[idx3(i,j,k+1)];
+            P[id]=(sum - Div[id])/6.0f;
         }
     }
 }
-
-// ---------------- Rendering Helpers ----------------
-static Color ColorRamp(float v) {
-    // Normalized 0..1 -> blue->cyan->green->yellow->red
-    float r,g,b;
-    if (v < 0.25f) { float t=v/0.25f; r=0; g=t; b=1; }
-    else if (v < 0.5f) { float t=(v-0.25f)/0.25f; r=0; g=1; b=1-t; }
-    else if (v < 0.75f) { float t=(v-0.5f)/0.25f; r=t; g=1; b=0; }
-    else { float t=(v-0.75f)/0.25f; r=1; g=1-t; b=0; }
-    return (Color){(unsigned char)(r*255),(unsigned char)(g*255),(unsigned char)(b*255),120};
+static void SubtractPressureGradient(float *u,float *v,float *w){
+    const float inv2dx=0.5f/DX, inv2dy=0.5f/DY, inv2dz=0.5f/DZ;
+    for(int j=1;j<NY-1;++j) for(int k=1;k<NZ-1;++k) for(int i=1;i<NX-1;++i){
+        int id=idx3(i,j,k);
+        if(Solid[id]) continue;
+        float dpdx=(P[idx3(i+1,j,k)]-P[idx3(i-1,j,k)])*inv2dx;
+        float dpdy=(P[idx3(i,j+1,k)]-P[idx3(i,j-1,k)])*inv2dy;
+        float dpdz=(P[idx3(i,j,k+1)]-P[idx3(i,j,k-1)])*inv2dz;
+        u[id]-=dpdx; v[id]-=dpdy; w[id]-=dpdz;
+    }
+    EnforceSolids(u,v,w);
 }
 
-static void Weather_DrawOverlay(void) {
+// Tweaked condensation (more visible clouds)
+static void Condense(float *temp,float *hum,float *cloud,float dt){
+    for(int id=0; id<NX*NY*NZ; ++id){
+        if(Solid[id]){ cloud[id]=0.0f; continue; }
+        float Tn = temp[id];
+        float sat = clampf(0.45f*Tn + 0.20f, 0.12f, 0.70f);  // lower saturation
+        float excess = hum[id] - sat;
+        if (excess > 0.0f) {
+            float cond = 0.80f * excess;  // stronger condensation
+            hum[id]   -= cond;
+            cloud[id] += cond;
+        }
+        cloud[id] = fmaxf(0.0f, cloud[id] - 0.01f * dt); // slower fallout
+    }
+}
+
+static void SimStep(float dt){
+    AddInflow(U, H);
+    AddGroundEvaporation(H, dt);
+    AddBuoyancy(V, T, H, dt);
+
+    for(int id=0; id<NX*NY*NZ; ++id){ U0[id]=U[id]; V0[id]=V[id]; W0[id]=W[id]; }
+    Diffuse(U,U0,g_visc,dt,6,1);
+    Diffuse(V,V0,g_visc,dt,6,1);
+    Diffuse(W,W0,g_visc,dt,6,1);
+    EnforceSolids(U,V,W);
+
+    AdvectVelocityField(U0,V0,W0, U,V,W, dt);
+    for(int id=0; id<NX*NY*NZ; ++id){ U[id]=U0[id]; V[id]=V0[id]; W[id]=W0[id]; }
+    EnforceSolids(U,V,W);
+
+    ComputeDivergence(U,V,W);
+    SolvePressure();
+    SubtractPressureGradient(U,V,W);
+
+    for(int id=0; id<NX*NY*NZ; ++id){ T0[id]=T[id]; H0[id]=H[id]; C0[id]=C[id]; }
+    Diffuse(T,T0,g_diff,dt,4,0);
+    Diffuse(H,H0,g_diff,dt,4,0);
+    Diffuse(C,C0,g_diff*0.2f,dt,2,0);
+
+    AdvectScalarField(T0,T,U,V,W,dt);
+    AdvectScalarField(H0,H,U,V,W,dt);
+    AdvectScalarField(C0,C,U,V,W,dt);
+    for(int id=0; id<NX*NY*NZ; ++id){ T[id]=T0[id]; H[id]=H0[id]; C[id]=C0[id]; }
+
+    Condense(T,H,C,dt);
+}
+
+// ---------- Color maps ----------
+static Color TempToColor(float t, float a){
+    t=clampf(t,0,1); float r,g,b;
+    if(t<0.25f){ float u=t/0.25f; r=0; g=u; b=1; }
+    else if(t<0.5f){ float u=(t-0.25f)/0.25f; r=0; g=1; b=1-u; }
+    else if(t<0.75f){ float u=(t-0.5f)/0.25f; r=u; g=1; b=0; }
+    else { float u=(t-0.75f)/0.25f; r=1; g=1-u; b=0; }
+    return (Color){(unsigned char)(r*255),(unsigned char)(g*255),(unsigned char)(b*255),(unsigned char)a};
+}
+static Color HumToColor(float h, float a){
+    h=clampf(h,0,1);
+    float r=0.2f*h, g=0.45f+0.4f*h, b=0.8f+0.2f*h;
+    return (Color){(unsigned char)(r*255),(unsigned char)(g*255),(unsigned char)(b*255),(unsigned char)a};
+}
+static Color CloudToColor(float c){
+    c=clampf(c,0,1); unsigned char a=(unsigned char)clampf(c*255.0f, 20.0f, 235.0f);
+    return (Color){255,255,255,a};
+}
+
+// ---------- Slice textures ----------
+#define MAX_SLICES 64  // >= max(NX,NY,NZ). Here max=48, so 64 is safe.
+
+typedef enum { AXIS_X=0, AXIS_Y=1, AXIS_Z=2 } SliceAxis;
+static Texture2D gSlices[MAX_SLICES];
+static int gSliceCount = 0;
+static int gSliceW = 0, gSliceH = 0;
+static SliceAxis gAxis = AXIS_Y;
+static bool gSlicesInit = false;
+
+static void UnloadSlices(void){
+    if (!gSlicesInit) return;
+    for (int s=0; s<gSliceCount; ++s) if (gSlices[s].id != 0) UnloadTexture(gSlices[s]);
+    gSlicesInit = false; gSliceCount=0; gSliceW=gSliceH=0;
+}
+
+static void CreateSlices(SliceAxis axis){
+    UnloadSlices();
+    gAxis = axis;
+    if (axis == AXIS_Y) { gSliceCount=NY; gSliceW=NX; gSliceH=NZ; }
+    else if (axis == AXIS_X){ gSliceCount=NX; gSliceW=NZ; gSliceH=NY; }
+    else { gSliceCount=NZ; gSliceW=NX; gSliceH=NY; }
+
+    Image img = GenImageColor(gSliceW, gSliceH, BLANK);
+    for (int s=0; s<gSliceCount; ++s) {
+        gSlices[s] = LoadTextureFromImage(img);
+        SetTextureFilter(gSlices[s], TEXTURE_FILTER_BILINEAR);
+        SetTextureWrap(gSlices[s], TEXTURE_WRAP_CLAMP);
+    }
+    UnloadImage(img);
+    gSlicesInit = true;
+}
+
+static void UpdateSlicesTextures(void){
+    if (!gSlicesInit) return;
+
+    static Color *pixels = NULL;
+    static int capW = 0, capH = 0;
+    if (capW != gSliceW || capH != gSliceH || pixels == NULL) {
+        if (pixels) MemFree(pixels);
+        pixels = MemAlloc(gSliceW * gSliceH * sizeof(Color));
+        capW = gSliceW; capH = gSliceH;
+    }
+
+    for (int s=0; s<gSliceCount; ++s) {
+        if (gAxis == AXIS_Y) {
+            int j = s;
+            for (int v=0; v<gSliceH; ++v) {
+                int k = v;
+                for (int u=0; u<gSliceW; ++u) {
+                    int i = u;
+                    int id = idx3(i,j,k);
+                    Color c = (Color){0,0,0,0};
+                    if (!Solid[id]) {
+                        if (g_mode == 1)      c = TempToColor(T[id], clampf(H[id]*230.0f + 20.0f, 0.0f, 235.0f));
+                        else if (g_mode == 2) c = HumToColor(H[id],  clampf(H[id]*255.0f,          10.0f, 235.0f));
+                        else                   c = CloudToColor(C[id]);
+                    }
+                    pixels[v*gSliceW + u] = c;
+                }
+            }
+        } else if (gAxis == AXIS_X) {
+            int i = s;
+            for (int v=0; v<gSliceH; ++v) {
+                int j = v;
+                for (int u=0; u<gSliceW; ++u) {
+                    int k = u;
+                    int id = idx3(i,j,k);
+                    Color c = (Color){0,0,0,0};
+                    if (!Solid[id]) {
+                        if (g_mode == 1)      c = TempToColor(T[id], clampf(H[id]*230.0f + 20.0f, 0.0f, 235.0f));
+                        else if (g_mode == 2) c = HumToColor(H[id],  clampf(H[id]*255.0f,          10.0f, 235.0f));
+                        else                   c = CloudToColor(C[id]);
+                    }
+                    pixels[v*gSliceW + u] = c;
+                }
+            }
+        } else { // AXIS_Z
+            int k = s;
+            for (int v=0; v<gSliceH; ++v) {
+                int j = v;
+                for (int u=0; u<gSliceW; ++u) {
+                    int i = u;
+                    int id = idx3(i,j,k);
+                    Color c = (Color){0,0,0,0};
+                    if (!Solid[id]) {
+                        if (g_mode == 1)      c = TempToColor(T[id], clampf(H[id]*230.0f + 20.0f, 0.0f, 235.0f));
+                        else if (g_mode == 2) c = HumToColor(H[id],  clampf(H[id]*255.0f,          10.0f, 235.0f));
+                        else                   c = CloudToColor(C[id]);
+                    }
+                    pixels[v*gSliceW + u] = c;
+                }
+            }
+        }
+        UpdateTexture(gSlices[s], pixels);
+    }
+}
+
+// Draw a textured axis-aligned quad in 3D (double-sided)
+static void DrawSliceQuad(Texture2D tex, SliceAxis axis, int sIndex){
     rlDisableBackfaceCulling();
-    rlDisableDepthMask();
-    for (int z = 0; z < GRID_H - 1; ++z) {
-        rlBegin(RL_QUADS);
-        for (int x = 0; x < GRID_W - 1; ++x) {
-            int i00 = IDX(x,z); int i10 = IDX(x+1,z); int i11 = IDX(x+1,z+1); int i01 = IDX(x,z+1);
-            float h00 = heightField[i00]; float h10 = heightField[i10]; float h11 = heightField[i11]; float h01 = heightField[i01];
-            float s00=0,s10=0,s11=0,s01=0;
-            if (showTemp) { s00=grid[i00].T[0]; s10=grid[i10].T[0]; s11=grid[i11].T[0]; s01=grid[i01].T[0]; }
-            else if (showHum) { s00=grid[i00].q[0]; s10=grid[i10].q[0]; s11=grid[i11].q[0]; s01=grid[i01].q[0]; }
-            else if (showCloud){ s00=grid[i00].cloud[1]; s10=grid[i10].cloud[1]; s11=grid[i11].cloud[1]; s01=grid[i01].cloud[1]; }
-            float minV = showTemp ? (BASE_SEA_LEVEL_TEMP - 25.0f) : 0.0f;
-            float maxV = showTemp ? (BASE_SEA_LEVEL_TEMP + 15.0f) : 1.5f;
-            float n00=(s00-minV)/(maxV-minV); if(n00<0)n00=0; if(n00>1)n00=1;
-            float n10=(s10-minV)/(maxV-minV); if(n10<0)n10=0; if(n10>1)n10=1;
-            float n11=(s11-minV)/(maxV-minV); if(n11<0)n11=0; if(n11>1)n11=1;
-            float n01=(s01-minV)/(maxV-minV); if(n01<0)n01=0; if(n01>1)n01=1;
-            Color c00=ColorRamp(n00), c10=ColorRamp(n10), c11=ColorRamp(n11), c01=ColorRamp(n01);
-            rlColor4ub(c00.r,c00.g,c00.b,c00.a); rlVertex3f((float)x, h00+0.5f, (float)z);
-            rlColor4ub(c10.r,c10.g,c10.b,c10.a); rlVertex3f((float)(x+1), h10+0.5f, (float)z);
-            rlColor4ub(c11.r,c11.g,c11.b,c11.a); rlVertex3f((float)(x+1), h11+0.5f, (float)(z+1));
-            rlColor4ub(c01.r,c01.g,c01.b,c01.a); rlVertex3f((float)x, h01+0.5f, (float)(z+1));
-        }
-        rlEnd();
+    rlSetTexture(tex.id);
+    rlBegin(RL_TRIANGLES);
+    rlColor4ub(255,255,255,255);
+
+    if (axis == AXIS_Y) {
+        float y = (sIndex + 0.5f)*DY;
+        rlTexCoord2f(0.0f, 1.0f); rlVertex3f(0.0f, y, 0.0f);
+        rlTexCoord2f(1.0f, 1.0f); rlVertex3f(TERRAIN_SIZE_X, y, 0.0f);
+        rlTexCoord2f(1.0f, 0.0f); rlVertex3f(TERRAIN_SIZE_X, y, TERRAIN_SIZE_Z);
+
+        rlTexCoord2f(0.0f, 1.0f); rlVertex3f(0.0f, y, 0.0f);
+        rlTexCoord2f(1.0f, 0.0f); rlVertex3f(TERRAIN_SIZE_X, y, TERRAIN_SIZE_Z);
+        rlTexCoord2f(0.0f, 0.0f); rlVertex3f(0.0f, y, TERRAIN_SIZE_Z);
+
+    } else if (axis == AXIS_X) {
+        float x = (sIndex + 0.5f)*DX;
+        rlTexCoord2f(0.0f, 1.0f); rlVertex3f(x, 0.0f, 0.0f);
+        rlTexCoord2f(1.0f, 1.0f); rlVertex3f(x, 0.0f, TERRAIN_SIZE_Z);
+        rlTexCoord2f(1.0f, 0.0f); rlVertex3f(x, WORLD_TOP_Y, TERRAIN_SIZE_Z);
+
+        rlTexCoord2f(0.0f, 1.0f); rlVertex3f(x, 0.0f, 0.0f);
+        rlTexCoord2f(1.0f, 0.0f); rlVertex3f(x, WORLD_TOP_Y, TERRAIN_SIZE_Z);
+        rlTexCoord2f(0.0f, 0.0f); rlVertex3f(x, WORLD_TOP_Y, 0.0f);
+
+    } else { // AXIS_Z
+        float z = (sIndex + 0.5f)*DZ;
+        rlTexCoord2f(0.0f, 1.0f); rlVertex3f(0.0f, 0.0f, z);
+        rlTexCoord2f(1.0f, 1.0f); rlVertex3f(TERRAIN_SIZE_X, 0.0f, z);
+        rlTexCoord2f(1.0f, 0.0f); rlVertex3f(TERRAIN_SIZE_X, WORLD_TOP_Y, z);
+
+        rlTexCoord2f(0.0f, 1.0f); rlVertex3f(0.0f, 0.0f, z);
+        rlTexCoord2f(1.0f, 0.0f); rlVertex3f(TERRAIN_SIZE_X, WORLD_TOP_Y, z);
+        rlTexCoord2f(0.0f, 0.0f); rlVertex3f(0.0f, WORLD_TOP_Y, z);
     }
-    rlEnableDepthMask();
+    rlEnd();
+    rlSetTexture(0);
     rlEnableBackfaceCulling();
 }
 
-static void Weather_DrawWindVectors(void) {
-    for (int z = 0; z < GRID_H; z += 8) {
-        for (int x = 0; x < GRID_W; x += 8) {
-            int i = IDX(x,z);
-            float u = flowField[i].u[0]; float v = flowField[i].v[0];
-            float len = sqrtf(u*u + v*v);
-            if (len < 0.05f) continue;
-            Vector3 p = (Vector3){(float)x, heightField[i] + 2.0f, (float)z};
-            Vector3 q = (Vector3){p.x + u*0.5f, p.y, p.z + v*0.5f};
-            DrawLine3D(p,q, SKYBLUE);
-            Vector3 dir = Vector3Normalize((Vector3){u,0,v});
-            Vector3 left = (Vector3){-dir.z,0,dir.x};
-            Vector3 head1 = Vector3Add(q, Vector3Scale(Vector3Add(dir,left), -0.8f));
-            Vector3 head2 = Vector3Add(q, Vector3Scale(Vector3Subtract(dir,left), -0.8f));
-            DrawLine3D(q, head1, SKYBLUE); DrawLine3D(q, head2, SKYBLUE);
-        }
-    }
-}
-
-static void Weather_DrawClouds(void) {
-    for (int z = 0; z < GRID_H; z += 4) {
-        for (int x = 0; x < GRID_W; x += 4) {
-            int i = IDX(x,z);
-            float c = grid[i].cloud[1];
-            if (c > 0.05f) {
-                float h = heightField[i] + LAYER_THICKNESS * 1.0f;
-                float radius = 2.0f + c * 8.0f;
-                unsigned char alpha = (unsigned char)Clamp(c * 255.0f, 40.0f, 220.0f);
-                DrawSphereEx((Vector3){(float)x, h + 20.0f, (float)z}, radius, 8, 8, (Color){255,255,255,alpha});
+// ---------- Debug cubes ----------
+static void DrawDebugCubes(void){
+    BeginBlendMode(BLEND_ALPHA);
+    int step = g_drawStep;
+    for (int j=0;j<NY;j+=step){
+        float y=(j+0.5f)*DY;
+        for(int k=0;k<NZ;k+=step){
+            float z=(k+0.5f)*DZ;
+            for(int i=0;i<NX;i+=step){
+                float x=(i+0.5f)*DX;
+                int id=idx3(i,j,k);
+                if(Solid[id]) continue;
+                Color col; bool draw=false;
+                if(g_mode==1){
+                    float a=clampf(H[id]*220.0f+15.0f,0.0f,235.0f);
+                    col=TempToColor(T[id], a);
+                    draw = (H[id]>0.03f) || (T[id]<0.3f || T[id]>0.7f);
+                } else if(g_mode==2){
+                    float a=clampf(H[id]*255.0f, 10.0f, 235.0f);
+                    col=HumToColor(H[id], a);
+                    draw = (H[id] > 0.08f);
+                } else {
+                    col=CloudToColor(C[id]);
+                    draw=(C[id]>0.01f);
+                }
+                if(!draw) continue;
+                Vector3 pos={x,y,z}, size={DX*0.9f*step, DY*0.85f*step, DZ*0.9f*step};
+                DrawCubeV(pos,size,col);
             }
         }
     }
+    EndBlendMode();
 }
 
-// ---------------- Mouse Picking ----------------
-static int MouseToGrid(int *outX, int *outZ, Camera3D cam) {
-    Vector2 mouse = GetMousePosition();
-    Ray ray = GetMouseRay(mouse, cam);
-    for (float t = 0; t < 2000.0f; t += 5.0f) {
-        Vector3 pos = Vector3Add(ray.position, Vector3Scale(ray.direction, t));
-        int gx = (int)roundf(pos.x); int gz = (int)roundf(pos.z);
-        if (gx >= 0 && gx < GRID_W && gz >= 0 && gz < GRID_H) {
-            float terrainH = heightField[IDX(gx,gz)] + 2.0f;
-            if (pos.y <= terrainH) { *outX = gx; *outZ = gz; return 1; }
-        }
+// ---------- Min/Max readout ----------
+static void GetFieldMinMax(float* arr, float* outMin, float* outMax){
+    float mn=1e9f, mx=-1e9f;
+    for(int id=0; id<NX*NY*NZ; ++id){
+        if(Solid[id]) continue;
+        float v=arr[id];
+        if(v<mn) mn=v;
+        if(v>mx) mx=v;
     }
-    return 0;
+    *outMin = (mn==1e9f)?0.0f:mn; *outMax = (mx==-1e9f)?0.0f:mx;
 }
 
-// ---------------- Main ----------------
-int main(void) {
-    InitWindow(1400, 900, "Terrain Weather Simulation");
+// ---------- Axis selection with hysteresis ----------
+static SliceAxis ChooseAxisWithHysteresis(Vector3 fwd, SliceAxis current) {
+    float ax = fabsf(fwd.x), ay = fabsf(fwd.y), az = fabsf(fwd.z);
+    SliceAxis bestA = AXIS_X;
+    float best = ax, second = fmaxf(ay, az);
+    if (ay > best) { second = fmaxf(ax, az); best = ay; bestA = AXIS_Y; }
+    if (az > best) { second = fmaxf(ax, ay); best = az; bestA = AXIS_Z; }
+    const float HYST = 0.08f;
+    if (best - second < HYST) return current;
+    return bestA;
+}
+
+// ---------- Main ----------
+int main(int argc, char** argv){
+    const char* objPath = (argc>1)? argv[1] : "eroded_terrain.obj";
+    if(!LoadTerrainHeightFromOBJ(objPath)){
+        TraceLog(LOG_ERROR,"Failed to read terrain from %s", objPath);
+        return 1;
+    }
+
+    InitWindow(1400, 900, "Volumetric Weather (Slices)");
     SetTargetFPS(60);
 
-    const char *terrainFile = "eroded_terrain.obj"; // Adjust path as needed
-    Model terrain = LoadOBJBuildHeight(terrainFile);
-
-    if (terrain.meshCount == 0 || terrain.meshes[0].vertexCount == 0) {
-        TraceLog(LOG_WARNING, "Terrain mesh empty; running on flat ground.");
-    }
-
-    for (int i = 0; i < GRID_W * GRID_H; ++i) if (!isfinite(heightField[i])) heightField[i] = 0.0f;
-
     Camera3D cam = {0};
-    cam.position = (Vector3){128.0f, 180.0f, 330.0f};
-    cam.target   = (Vector3){128.0f, 0.0f, 128.0f};
-    cam.up       = (Vector3){0.0f,1.0f,0.0f};
+    cam.position = (Vector3){140.0f, 130.0f, 360.0f};
+    cam.target   = (Vector3){TERRAIN_SIZE_X*0.5f, 30.0f, TERRAIN_SIZE_Z*0.5f};
+    cam.up       = (Vector3){0,1,0};
     cam.fovy     = 45.0f;
     cam.projection = CAMERA_PERSPECTIVE;
 
-    float rotation = 0.0f;
-    float distance = 320.0f;
-    bool wireframe = false;
+    Model terrain = BuildTerrainModelFromHeight();
 
-    Weather_Reset();
+    AllocateFields();
+    ResetFields();
 
-    float simTime = 0.0f; // simulated seconds
+    // Initial slice axis (top-down → use Y)
+    CreateSlices(AXIS_Y);
 
-    while (!WindowShouldClose()) {
-        float realDt = GetFrameTime();
-        float dtSim  = realDt * TIME_SCALE;
-        simTime += dtSim;
+    float rot=0.0f, dist=340.0f;
+    bool paused=false;
 
+    while(!WindowShouldClose()){
         // Input
-        if (IsKeyPressed(KEY_W)) wireframe = !wireframe;
-        if (IsKeyPressed(KEY_ONE))   { showTemp=1; showHum=0; showCloud=0; }
-        if (IsKeyPressed(KEY_TWO))   { showTemp=0; showHum=1; showCloud=0; }
-        if (IsKeyPressed(KEY_THREE)) { showTemp=0; showHum=0; showCloud=1; }
-        if (IsKeyPressed(KEY_FOUR))  showWind = !showWind;
-        if (IsKeyPressed(KEY_R))     { Weather_Reset(); simTime = 0.0f; }
-        if (IsKeyDown(KEY_KP_ADD) || IsKeyDown(KEY_EQUAL)) TIME_SCALE *= 1.02f;
-        if (IsKeyDown(KEY_KP_SUBTRACT) || IsKeyDown(KEY_MINUS)) TIME_SCALE /= 1.02f;
-        if (TIME_SCALE < 1.0f) TIME_SCALE = 1.0f;
-        if (TIME_SCALE > 5000.0f) TIME_SCALE = 5000.0f;
+        if(IsKeyPressed(KEY_SPACE)) paused=!paused;
+        if(IsKeyPressed(KEY_ONE)) g_mode=1;
+        if(IsKeyPressed(KEY_TWO)) g_mode=2;
+        if(IsKeyPressed(KEY_THREE)) g_mode=3;
+        if(IsKeyPressed(KEY_W)) g_wireframeTerrain=!g_wireframeTerrain;
+        if(IsKeyPressed(KEY_R)) ResetFields();
+        if(IsKeyPressed(KEY_B)) g_debugCubes=!g_debugCubes;
+        if(IsKeyPressed(KEY_LEFT_BRACKET))  g_drawStep = (g_drawStep>1)? g_drawStep-1 : 1;
+        if(IsKeyPressed(KEY_RIGHT_BRACKET)) g_drawStep = (g_drawStep<8)? g_drawStep+1 : 8;
+        if(IsKeyPressed(KEY_COMMA))  g_dt=fmaxf(0.02f, g_dt*0.8f);
+        if(IsKeyPressed(KEY_PERIOD)) g_dt=fminf(0.25f, g_dt*1.25f);
 
-        if (IsKeyDown(KEY_LEFT))  rotation += 0.5f * realDt;
-        if (IsKeyDown(KEY_RIGHT)) rotation -= 0.5f * realDt;
-        distance -= GetMouseWheelMove() * 10.0f; distance = Clamp(distance, 80.0f, 1000.0f);
-        float camX = sinf(rotation) * distance + cam.target.x;
-        float camZ = cosf(rotation) * distance + cam.target.z;
-        float camY = distance * 0.5f;
-        cam.position = (Vector3){camX, camY, camZ};
+        if(IsKeyDown(KEY_LEFT))  rot += 0.01f;
+        if(IsKeyDown(KEY_RIGHT)) rot -= 0.01f;
+        dist -= GetMouseWheelMove()*8.0f;
+        dist = clampf(dist, 120.0f, 900.0f);
+        float cx=sinf(rot)*dist, cz=cosf(rot)*dist, cy=dist*0.45f;
+        cam.position = Vector3Add(cam.target, (Vector3){cx,cy,cz});
 
-        if (IsKeyDown(KEY_SPACE)) {
-            int gx,gz; if (MouseToGrid(&gx,&gz, cam)) Weather_InjectMoisture(gx,gz, 10.0f);
-        }
+        // Choose slice axis with hysteresis
+        Vector3 fwd = Vector3Normalize(Vector3Subtract(cam.target, cam.position));
+        SliceAxis desiredAxis = ChooseAxisWithHysteresis(fwd, gAxis);
+        if (desiredAxis != gAxis) CreateSlices(desiredAxis);
 
-        Weather_Step(dtSim, simTime);
+        // Step sim
+        if(!paused){ for(int s=0; s<g_substeps; ++s) SimStep(g_dt); }
 
+        // Update slice textures from current field
+        UpdateSlicesTextures();
+
+        // Draw
         BeginDrawing();
         ClearBackground((Color){10,10,14,255});
-
         BeginMode3D(cam);
-            if (wireframe) {
-                Mesh *m = &terrain.meshes[0];
-                rlDisableTexture();
-                rlBegin(RL_LINES);
-                if (m->indices) {
-                    for (int t = 0; t < m->triangleCount; ++t) {
-                        int i0 = m->indices[t*3 + 0]; int i1 = m->indices[t*3 + 1]; int i2 = m->indices[t*3 + 2];
-                        if (i0>=m->vertexCount||i1>=m->vertexCount||i2>=m->vertexCount) continue;
-                        Vector3 v0 = {m->vertices[i0*3+0], m->vertices[i0*3+1], m->vertices[i0*3+2]};
-                        Vector3 v1 = {m->vertices[i1*3+0], m->vertices[i1*3+1], m->vertices[i1*3+2]};
-                        Vector3 v2 = {m->vertices[i2*3+0], m->vertices[i2*3+1], m->vertices[i2*3+2]};
-                        rlColor4ub(140,140,140,255);
-                        rlVertex3f(v0.x,v0.y,v0.z); rlVertex3f(v1.x,v1.y,v1.z);
-                        rlVertex3f(v1.x,v1.y,v1.z); rlVertex3f(v2.x,v2.y,v2.z);
-                        rlVertex3f(v2.x,v2.y,v2.z); rlVertex3f(v0.x,v0.y,v0.z);
-                    }
-                } else { // non-indexed fallback
-                    int triVertCount = m->vertexCount - (m->vertexCount % 3);
-                    for (int i=0;i<triVertCount;i+=3){
-                        Vector3 v0={m->vertices[i*3+0],m->vertices[i*3+1],m->vertices[i*3+2]};
-                        Vector3 v1={m->vertices[(i+1)*3+0],m->vertices[(i+1)*3+1],m->vertices[(i+1)*3+2]};
-                        Vector3 v2={m->vertices[(i+2)*3+0],m->vertices[(i+2)*3+1],m->vertices[(i+2)*3+2]};
-                        rlColor4ub(140,140,140,255);
-                        rlVertex3f(v0.x,v0.y,v0.z); rlVertex3f(v1.x,v1.y,v1.z);
-                        rlVertex3f(v1.x,v1.y,v1.z); rlVertex3f(v2.x,v2.y,v2.z);
-                        rlVertex3f(v2.x,v2.y,v2.z); rlVertex3f(v0.x,v0.y,v0.z);
-                    }
-                }
-                rlEnd();
-            } else {
-                DrawModel(terrain, (Vector3){0,0,0}, 1.0f, WHITE);
+
+            // Terrain
+            if (g_wireframeTerrain) DrawModelWires(terrain, (Vector3){0}, 1.0f, (Color){200,200,200,255});
+            else                    DrawModel(terrain, (Vector3){0}, 1.0f, WHITE);
+
+            // Slices (disable depth writes to avoid white-sheet artifact)
+            rlDisableDepthMask();
+            BeginBlendMode(BLEND_ALPHA);
+
+            // Back-to-front order along the slicing axis based on view direction sign
+            if (gAxis == AXIS_Y) {
+                int start = (fwd.y < 0.0f) ? (NY-1) : 0;
+                int end   = (fwd.y < 0.0f) ? -1 : NY;
+                int step  = (fwd.y < 0.0f) ? -1 : 1;
+                for (int j=start; j!=end; j+=step) DrawSliceQuad(gSlices[j], AXIS_Y, j);
+            } else if (gAxis == AXIS_X) {
+                int start = (fwd.x < 0.0f) ? (NX-1) : 0;
+                int end   = (fwd.x < 0.0f) ? -1 : NX;
+                int step  = (fwd.x < 0.0f) ? -1 : 1;
+                for (int i=start; i!=end; i+=step) DrawSliceQuad(gSlices[i], AXIS_X, i);
+            } else { // AXIS_Z
+                int start = (fwd.z < 0.0f) ? (NZ-1) : 0;
+                int end   = (fwd.z < 0.0f) ? -1 : NZ;
+                int step  = (fwd.z < 0.0f) ? -1 : 1;
+                for (int k=start; k!=end; k+=step) DrawSliceQuad(gSlices[k], AXIS_Z, k);
             }
-            if (showTemp || showHum || showCloud) Weather_DrawOverlay();
-            if (showWind) Weather_DrawWindVectors();
-            Weather_DrawClouds();
+
+            EndBlendMode();
+            rlEnableDepthMask();
+
+            // Optional cube debug overlay
+            if (g_debugCubes) DrawDebugCubes();
+
         EndMode3D();
 
+        // Min/max HUD
+        float tMin,tMax,hMin,hMax,cMin,cMax;
+        GetFieldMinMax(T,&tMin,&tMax);
+        GetFieldMinMax(H,&hMin,&hMax);
+        GetFieldMinMax(C,&cMin,&cMax);
+
         DrawFPS(10,10);
-        DrawText(TextFormat("TimeScale: %.1f x", TIME_SCALE), 10, 30, 18, LIGHTGRAY);
-        DrawText(TextFormat("SimDayFrac: %.2f", fmodf(simTime/86400.0f,1.0f)), 10, 50, 18, LIGHTGRAY);
-        DrawText("1:T 2:H 3:Cloud 4:Wind W:Wire SPACE:Moisture +/-:Time R:Reset", 10, 70, 18, SKYBLUE);
-        const char *overlay = showTemp?"Temp":(showHum?"Humidity":(showCloud?"Cloud":"None"));
-        DrawText(TextFormat("Overlay: %s", overlay), 10, 90, 18, GREEN);
+        DrawText(paused ? "PAUSED" : "RUNNING", 10, 34, 18, paused?RED:GREEN);
+        DrawText(TextFormat("Mode: %s   dt: %.3f   Axis: %s   Cubes:%s",
+                            (g_mode==1)?"Temp":(g_mode==2)?"Humidity":"Clouds",
+                            g_dt, (gAxis==AXIS_Y)?"Y":(gAxis==AXIS_X)?"X":"Z",
+                            g_debugCubes?"ON":"OFF"),
+                 10, 56, 18, RAYWHITE);
+        DrawText(TextFormat("T[min,max]=[%.2f, %.2f]  H[min,max]=[%.2f, %.2f]  C[min,max]=[%.2f, %.2f]",
+                            tMin,tMax,hMin,hMax,cMin,cMax),
+                 10, 78, 18, (Color){200,200,200,255});
+        DrawText("SPACE pause | 1 Temp | 2 Hum | 3 Clouds | B cubes | [ ] density | , . dt | W wires | R reset",
+                 10, 100, 16, (Color){180,180,180,255});
 
         EndDrawing();
     }
 
+    UnloadSlices();
     UnloadModel(terrain);
+    FreeFields();
     CloseWindow();
     return 0;
 }

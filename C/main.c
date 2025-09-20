@@ -10,13 +10,13 @@
 #define MAP_SIZE 256
 #define OCTAVES 4
 
-#define EROSION_DROPLETS 700000
+#define EROSION_DROPLETS 1000000
 #define EROSION_LIFETIME 2
-#define EROSION_INERTIA 0.001f
-#define EROSION_CAPACITY 2.0f
+#define EROSION_INERTIA 0.02f
+#define EROSION_CAPACITY 3.0f
 #define EROSION_MIN_SLOPE 0.001f    
 #define EROSION_ERODE 0.04f 
-#define EROSION_DEPOSIT 0.03f  
+#define EROSION_DEPOSIT 0.04f  
 #define EROSION_EVAPORATE 0.1f
 #define EROSION_MAX_STEP 1.0f     // limit per‐step removal
 
@@ -37,15 +37,15 @@ float guiRockThreshold = 0.3f;  // Rock vs grass threshold
 // Text buffers for value boxes
 char guiFreqText[32] = "0.004";
 char guiAmpText[32] = "1.0";
-char guiErodeRateText[32] = "0.040";
-char guiDepositRateText[32] = "0.030";
-char guiInertiaText[32] = "0.001";
+char guiErodeRateText[32] = "0.020";
+char guiDepositRateText[32] = "0.040";
+char guiInertiaText[32] = "0.02";
 char guiLifetimeText[32] = "2";
-char guiCapacityText[32] = "2.0";
+char guiCapacityText[32] = "3.0";
 char guiMinSlopeText[32] = "0.001";
 char guiEvaporateText[32] = "0.1";
 char guiMaxStepText[32] = "1.0";
-char guiDropletsText[32] = "700000";
+char guiDropletsText[32] = "1000000";
 char guiRockThresholdText[32] = "0.3";
 
 // Edit mode flags
@@ -76,6 +76,7 @@ static int dropletPathLen = 0;
 static float heightmap[MAP_SIZE][MAP_SIZE];
 static float heightmap_perlin[MAP_SIZE][MAP_SIZE];
 static float heightmap_eroded[MAP_SIZE][MAP_SIZE];
+static int   heatCount[MAP_SIZE][MAP_SIZE]; // droplet visit counts for heatmap
 
 static float Smoothstep(float t) {
     return t * t * (3.0f - 2.0f * t);
@@ -86,7 +87,6 @@ static int Hash(int x, int y) {
     h = (h ^ (h >> 13)) * 1274126177;
     return h & 1023;
 }
-
 static float Gradient(int hash, float x, float y) {
     switch (hash & 3) {
         case 0: return  x + y;
@@ -157,6 +157,10 @@ static void GenerateLayeredNoiseHeightmap(float map[MAP_SIZE][MAP_SIZE]) {
 }
 
 static void ApplyHydroErosion(float map[MAP_SIZE][MAP_SIZE]) {
+    // reset heatmap counters
+    for (int z = 0; z < MAP_SIZE; z++)
+        for (int x = 0; x < MAP_SIZE; x++)
+            heatCount[x][z] = 0;
     for (int n = 0; n < guiDroplets; n++) {
         float x = (float)(rand() % (MAP_SIZE - 1)) + 0.5f;
         float y = (float)(rand() % (MAP_SIZE - 1)) + 0.5f;
@@ -168,6 +172,7 @@ static void ApplyHydroErosion(float map[MAP_SIZE][MAP_SIZE]) {
         for (int lifetime = 0; lifetime < guiLifetime; lifetime++) {
             int xi = (int)x;
             int yi = (int)y;
+            heatCount[xi][yi]++; // accumulate visits for heatmap
             if (xi < 0 || xi >= MAP_SIZE - 1 || yi < 0 || yi >= MAP_SIZE - 1) break;
 
             // Calculate height and gradient using bilinear interpolation

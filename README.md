@@ -72,3 +72,23 @@ Both scripts generate and visualize 3D terrain with erosion and realistic colori
 - Binaries (`terrain`, `weather`, `obj`) are generated from their respective `.c` files.
 - The C programs use Raylib for graphics and input; Python uses PyOpenGL and pygame.
 - For more details on controls and features, see comments at the top of each source file. 
+
+
+gcc main.c \
+    -o terrain \
+    -I/opt/homebrew/include \
+    -L/opt/homebrew/lib \
+    -Wall -Wextra -Wshadow -Wpointer-arith -Wstrict-prototypes -Wmissing-prototypes -Wswitch-enum \
+    -O3 -march=native -flto -DNDEBUG \
+    -lraylib -lm \
+    -framework OpenGL -framework Cocoa -framework IOKit \
+    -framework CoreAudio -framework CoreVideo \
+    -std=c99
+
+
+
+to run
+
+
+
+
